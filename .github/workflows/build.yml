@@ -21,7 +21,7 @@ jobs:
     - name: Checkout PS5SDK
       uses: actions/checkout@v3
       with:
-        repository: PS5Dev/PS5SDK
+        repository: ciss84/PS5SDK
         path: ${{ env.PS5SDK }}
 
     - name: Build SDK
