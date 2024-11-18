@@ -742,6 +742,18 @@ int payload_main(struct payload_args *args)
         offsets.offset_pml4pml4i      = 0x3257A5C;
         offsets.offset_datacave_1     = 0x4270000;
         offsets.offset_datacave_2     = 0x4280000;
+    case 0x5500008:
+        offsets.offset_authmgr_handle = 0xDEF410;  //OK
+        offsets.offset_sbl_mb_mtx     = 0x3398F64; //OK
+        offsets.offset_mailbox_base   = 0x3398F80; //OK
+        offsets.offset_sbl_sxlock     = 0x3398F88; //OK
+        offsets.offset_mailbox_flags  = 0x2E99FC0; //OK
+        offsets.offset_mailbox_meta   = 0x2E99D60; //OK
+        offsets.offset_dmpml4i        = 0X3384D24; //OK
+        offsets.offset_dmpdpi         = 0X3384D28; //OK
+        offsets.offset_pml4pml4i      = 0x0;
+        offsets.offset_datacave_1     = 0x4270000;
+        offsets.offset_datacave_2     = 0x4280000;        
         break;
     default:
         SOCK_LOG(sock, "[!] unsupported firmware, dumping then bailing!\n");
