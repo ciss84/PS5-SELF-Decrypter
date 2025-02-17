@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 
 #include <ps5/kernel.h>
 
@@ -19,7 +21,7 @@
 #include "elf.h"
 
 #ifdef LOG_TO_SOCKET
-#define PC_IP   "10.0.0.233"
+#define PC_IP   "10.0.3.3"
 #define PC_PORT 5655
 #endif
 struct tailored_offsets
@@ -42,8 +44,10 @@ uint64_t g_kernel_data_base;
 char *g_bump_allocator_base;
 char *g_bump_allocator_cur;
 uint64_t g_bump_allocator_len;
-char *g_hexbuf;
-char *g_dirent_buf;
+
+char *g_dump_queue_buf = NULL;
+int g_dump_queue_buf_pos = 0;
+#define G_DUMP_QUEUE_BUF_SIZE 1 * 1024 * 1024 // 1MB
 
 void *bump_alloc(uint64_t len)
 {
@@ -76,20 +80,18 @@ void bump_reset()
 
 void sock_print(int sock, char *str)
 {
-    if (sock <= 0)
-    {
-        printf("%s", str);
-        return;
-    }
-    
+#ifdef LOG_TO_SOCKET   
 	size_t size;
 
 	size = strlen(str);
 	write(sock, str, size);
+#else
+    printf("%s", str);
+#endif
 }
 
 static void _mkdir(const char *dir) {
-    char tmp[256];
+    char tmp[PATH_MAX];
     char *p = NULL;
     size_t len;
 
@@ -160,6 +162,10 @@ struct self_block_segment *self_decrypt_segment(
     uint64_t data_blob_pa;
     char chunk_table_buf[0x1000] = {};
 
+    struct sce_self_segment_header *target_segment;
+    target_segment = (struct sce_self_segment_header *) (file_data +
+                        sizeof(struct sce_self_header) + (SELF_SEGMENT_ID(segment) * sizeof(struct sce_self_segment_header)));
+
     // Copy segment data into data cave #1
     data_blob_va   = g_kernel_data_base + offsets->offset_datacave_2;
     data_blob_pa   = pmap_kextract(sock, data_blob_va);
@@ -218,30 +224,59 @@ struct self_block_segment *self_decrypt_segment(
     segment_info->data = out_segment_data;
     segment_info->size = segment->uncompressed_size;
 
-    // We can get the block count by dividing the size by 0x28 (0x20 for digest, 0x8 for extent)
-    segment_info->block_count = segment_info->size / (0x20 + 0x8);
+    
+    if (SELF_SEGMENT_HAS_BLOCKINFO(segment)){
+        if (SELF_SEGMENT_HAS_DIGESTS(segment)){
+            segment_info->block_count = segment_info->size / (0x20 + 0x8);
+        } else {
+            segment_info->block_count = segment_info->size / 0x8;
+        }
+    } else {
+        segment_info->block_count = ceil((double)target_segment->uncompressed_size / SELF_SEGMENT_BLOCK_SIZE(target_segment));
+    }
 
     // Keep track of block digests
     digests = bump_calloc(segment_info->block_count, sizeof(void *));
     if (digests == NULL)
         return NULL;
 
-    cur_digest = (char *) out_segment_data;
-    for (int i = 0; i < segment_info->block_count; i++) {
-        digests[i] = (void *) cur_digest;
-        cur_digest += 0x20;
+    if (SELF_SEGMENT_HAS_DIGESTS(segment)) {
+        cur_digest = (char *) out_segment_data;
+        for (int i = 0; i < segment_info->block_count; i++) {
+            digests[i] = (void *) cur_digest;
+            cur_digest += 0x20;
+        }
     }
-
     segment_info->digests = digests;
 
     // Keep track of block extent information
-    block_infos    = bump_calloc(segment_info->block_count, sizeof(struct sce_self_block_info *));
+    block_infos = bump_calloc(segment_info->block_count, sizeof(struct sce_self_block_info *));
     if (block_infos == NULL)
         return NULL;
 
-    cur_block_info = (struct sce_self_block_info *) (out_segment_data + (0x20 * segment_info->block_count));
-    for (int i = 0; i < segment_info->block_count; i++) {
-        block_infos[i] = cur_block_info++;
+    if (SELF_SEGMENT_HAS_BLOCKINFO(segment)) {
+        cur_block_info = (struct sce_self_block_info *)out_segment_data;
+        if (SELF_SEGMENT_HAS_DIGESTS(segment)) {
+            cur_block_info = (struct sce_self_block_info *) (out_segment_data + (0x20 * segment_info->block_count));
+        }
+
+        for (int i = 0; i < segment_info->block_count; i++) {
+            block_infos[i] = cur_block_info++;
+        }
+    } else {
+        for (int i = 0; i < segment_info->block_count; i++) {
+            block_infos[i] = bump_alloc(sizeof(struct sce_self_block_info));
+            if (block_infos[i] == NULL)
+                return NULL;
+
+            block_infos[i]->offset = i * SELF_SEGMENT_BLOCK_SIZE(target_segment);
+         
+            if (i == segment_info->block_count - 1) {
+                block_infos[i]->len = target_segment->uncompressed_size % SELF_SEGMENT_BLOCK_SIZE(target_segment);
+            } else {
+                block_infos[i]->len = SELF_SEGMENT_BLOCK_SIZE(target_segment);
+            }
+        }
     }
 
     segment_info->extents = block_infos;
@@ -282,7 +317,7 @@ void *self_decrypt_block(
     }
 
     // Request segment decryption
-    for (int tries = 0; tries < 3; tries++) {
+    for (int tries = 0; tries < 5; tries++) {
         err = _sceSblAuthMgrSmLoadSelfBlock(
             sock,
             authmgr_handle,
@@ -296,11 +331,15 @@ void *self_decrypt_block(
         );
         if (err == 0)
             break;
-        sleep(1);
+
+        usleep(100000);
     }
 
     if (err != 0)
+    {
+        SOCK_LOG(sock, "[!] failed to decrypt block %d, err: %d\n", block_idx, err);
         return NULL;
+    }
 
     out_block_data = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (out_block_data == NULL)
@@ -347,6 +386,25 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
 
     fstat(self_file_fd, &self_file_stat);
     self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ, MAP_SHARED, self_file_fd, 0);
+    if (self_file_data == NULL || self_file_data == MAP_FAILED) {
+        SOCK_LOG(sock, "[!] file mmap failed, failling back to reading the file\n");
+        // some games give errno 12, but reading in the file works, weird
+        self_file_data = mmap(NULL, self_file_stat.st_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        size_t total_read = 0;
+        while (total_read < self_file_stat.st_size) {
+            size_t read_bytes = read(self_file_fd, self_file_data + total_read, self_file_stat.st_size - total_read);
+            if (read_bytes == 0) {
+                break;
+            } else if (read_bytes < 0) {
+                SOCK_LOG(sock, "[!] failed to read %s\n", path);
+                err = -30;
+                goto cleanup_in_file_data;
+            }
+
+            total_read += read_bytes;
+        }
+        SOCK_LOG(sock, "[+] read file into memory\n");
+    }
 
     if (*(uint32_t *) (self_file_data) != SELF_PROSPERO_MAGIC) {
         SOCK_LOG(sock, "[!] %s is not a PS5 SELF file\n", path);
@@ -499,7 +557,7 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         tail_block_size = segment->uncompressed_size % SELF_SEGMENT_BLOCK_SIZE(segment);
 
         for (int block = 0; block < block_info->block_count; block++) {
-            SOCK_LOG(sock, "  [?] decrypting segment=%d, block=%d/%lu\n", i, block + 1, block_info->block_count);
+            SOCK_LOG(sock, "  [?] %s: decrypting segment=%d, block=%d/%lu\n", path, i, block + 1, block_info->block_count);
             block_data[block] = self_decrypt_block(
                 sock,
                 authmgr_handle,
@@ -532,6 +590,8 @@ int decrypt_self(int sock, uint64_t authmgr_handle, char *path, int out_fd, stru
         }
     }
 
+    SOCK_LOG(sock, "[?] writing decrypted SELF to file...\n");
+
     written_bytes = write(out_fd, out_file_data, final_file_size);
     if (written_bytes != final_file_size) {
         SOCK_LOG(sock, "[!] failed to dump to file, %d != %lu (%d).\n", written_bytes, final_file_size, errno);
@@ -553,110 +613,251 @@ cleanup_in_file_data:
     return err;
 }
 
-void preload_dirents(int sock, char *dir, char *out)
+int dump_queue_init(int sock)
 {
-    int dir_fd;
-
-    // Walk the directory and find entries
-    dir_fd = open(dir, O_RDONLY, 0);
-    if (dir_fd < 0) {
-        SOCK_LOG(sock, "[!] failed to open directory\n");
-        return;
+    if (g_dump_queue_buf != NULL && g_dump_queue_buf != MAP_FAILED) {
+        return 0;
     }
-    SOCK_LOG(sock, "[?] dirfd = %d\n", dir_fd);
 
-    if (getdents(dir_fd, out, 0x10000) < 0) {
-        SOCK_LOG(sock, "[!] failed to get directory entries (%d)\n", errno);
-        close(dir_fd);
-        return;
+    g_dump_queue_buf = mmap(NULL, G_DUMP_QUEUE_BUF_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (g_dump_queue_buf == NULL || g_dump_queue_buf == MAP_FAILED) {
+        SOCK_LOG(sock, "[!] failed to allocate buffer for directory entries\n");
+        exit(-1);
+    }
+
+    return 0;
+}
+
+int dump_queue_reset()
+{
+    if (g_dump_queue_buf == NULL) {
+        return 0;
+    }
+
+    g_dump_queue_buf_pos = 0;
+    g_dump_queue_buf[0] = '\0';
+    return 0;
+}
+
+int dump_queue_add_file(int sock, char *path)
+{
+    dump_queue_init(sock);
+
+    static const char* allowed_exts[] = { ".elf", ".self", ".prx", ".sprx", ".bin" };
+    static const int allowed_exts_count = sizeof(allowed_exts) / sizeof(allowed_exts[0]);
+
+    int len = strlen(path);
+
+    // skip app0, we only want app0-patch0-union
+    if (len >= 35 && strncmp(path, "/mnt/sandbox/pfsmnt/", 20) == 0 && (strncmp(path + 29, "-app0/", 6) == 0 || strncmp(path + 29, "-patch0/", 8) == 0)) {
+#if DEBUG
+        SOCK_LOG(sock, "[!] ignoring app0/patch0: %s\n", path);
+#endif
+        return -1;
+    }
+    
+    char* dot = strrchr(path, '.'); // find last dot
+    if (dot == NULL) {
+        return -2;
+    }
+
+    int allowed = 0;
+    for (int i = 0; i < allowed_exts_count; i++) {
+        if (strcasecmp(dot, allowed_exts[i]) == 0) {
+            allowed = 1;
+            break;
+        }
+    }
+
+    if (!allowed) {
+#if DEBUG
+        SOCK_LOG(sock, "[!] unsupported file type: %s\n", path);
+#endif
+        return -3;
+    }
+
+    int fd = open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        SOCK_LOG(sock, "[!] failed to open file: %s\n", path);
+        return -4;
+    }
+
+    uint32_t magic = 0;
+    read(fd, &magic, sizeof(magic));
+    close(fd);
+    
+    if (magic != SELF_PROSPERO_MAGIC) {
+// #if DEBUG
+        SOCK_LOG(sock, "[!] not a PS5 SELF file: %s\n", path);
+// #endif
+        return -5;
+    }
+
+    int new_g_dump_queue_buf_pos = g_dump_queue_buf_pos + len + 1;
+    if (new_g_dump_queue_buf_pos >= G_DUMP_QUEUE_BUF_SIZE) {
+        SOCK_LOG(sock, "[!] dump queue buffer full\n");
+        exit(-2);
+    }
+
+    memcpy(g_dump_queue_buf + g_dump_queue_buf_pos, path, len + 1);
+
+#if DEBUG
+    SOCK_LOG(sock, "[+] added to dump queue: %s\n", path);
+#endif
+
+    g_dump_queue_buf_pos = new_g_dump_queue_buf_pos;
+
+    // null terminate the next entry so we know to break
+    g_dump_queue_buf[g_dump_queue_buf_pos] = '\0';
+    
+    return 0;
+}
+
+#define DENTS_BUF_SIZE 0x10000
+int dump_queue_add_dir(int sock, char* path, int recursive)
+{
+    int dir_fd = open(path, O_RDONLY, 0);
+    if (dir_fd < 0) {
+        SOCK_LOG(sock, "[!] failed to open directory: %s\n", path);
+        return -1;
+    }
+
+    // char dents[DENTS_BUF_SIZE] = {0};
+    char* dents = malloc(DENTS_BUF_SIZE);
+    while (1)
+    {
+        int n = getdents(dir_fd, dents, DENTS_BUF_SIZE);
+        if (n < 0) {
+            SOCK_LOG(sock, "[!] failed to get directory entries: %s\n", path);
+            close(dir_fd);
+            free(dents);
+            return -1;
+        }
+
+        if (n == 0) {
+            break;
+        }
+
+        struct dirent* entry = (struct dirent*)dents;
+        while ((char*)entry < dents + n)
+        {
+            if (entry->d_type == DT_REG) {
+                char full_path[PATH_MAX];
+                sprintf(full_path, "%s/%s", path, entry->d_name);
+                dump_queue_add_file(sock, full_path);
+            }
+            else if (recursive && entry->d_type == DT_DIR) {
+                if (entry->d_name[0] != '.') {
+                    char full_path[PATH_MAX];
+                    sprintf(full_path, "%s/%s", path, entry->d_name);
+                    dump_queue_add_dir(sock, full_path, recursive);
+                }
+            }
+
+            entry = (struct dirent*)((char*)entry + entry->d_reclen);
+        }
     }
 
     close(dir_fd);
+    free(dents);
+    return 0;    
 }
 
-void dump_dir(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, char *dents, char *dir, char *out_dir_path)
+
+int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, const char *out_dir_path)
 {
-    int err;
+    if (g_dump_queue_buf == NULL) {
+        return -1;
+    }
+
+    int err = 0;
     int out_fd;
-    struct dirent *entry;
-    char in_file_path[256];
-    char out_file_path[256];
+    char* entry;
+    char out_file_path[PATH_MAX];
     struct stat out_file_stat;
     uint64_t spinlock_lock = 0x13371337;
+    uint64_t spinlock_unlock = 0;
 
-    SOCK_LOG(sock, "[+] dumping %s...\n", dir);
-
-    // Make output directory just in case
-    _mkdir(out_dir_path);
+    uintptr_t sbl_sxlock_addr = g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18;
+    kernel_copyout(sbl_sxlock_addr, &spinlock_unlock, sizeof(spinlock_unlock));
 
     // Lock the SBL spinlock BKL style
     for (int i = 0; i < 0x100; i++) {
-        kernel_copyin(&spinlock_lock, g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18, 0x8);
+        kernel_copyin(&spinlock_lock, sbl_sxlock_addr, sizeof(spinlock_lock));
         usleep(1000);
     }
 
-    entry = (struct dirent *) dents;
-    while (entry->d_fileno) {
-        if (entry->d_type == DT_REG) {
-            sprintf((char *) &in_file_path, "%s/%s", dir, entry->d_name);
-            sprintf((char *) &out_file_path, "%s/%s", out_dir_path, entry->d_name);
+    entry = g_dump_queue_buf;
+    while (*entry != '\0') {
+        SOCK_LOG(sock, "[+] processing %s\n", entry);
+        int entry_len = strlen(entry);
 
-            // Check if output file already exists and is non-zero size, if so skip it
-            out_fd = open(out_file_path, O_RDONLY, 0);
-            if (out_fd >= 0) {
-                fstat(out_fd, &out_file_stat);
-                close(out_fd);
-                if (out_file_stat.st_size > 0) {
-                    entry = (struct dirent *) ((char *) entry + entry->d_reclen);
-                    continue;
-                }
-            }
+        sprintf((char *) &out_file_path, "%s%s", out_dir_path, entry);
 
-//            for (int i = 0; i < 0x100; i++) {
-//                kernel_copyin(&spinlock_lock, g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18, 0x8);
-//                usleep(100);
-//            }
-
-            // Decrypt
-            out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
-            err = decrypt_self(sock, authmgr_handle, in_file_path, out_fd, offsets);
-            if (err == -11) {
-                // Give 2 more attempts
-                for (int attempt = 0; attempt < 2; attempt++) {
-                    out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
-                    err = decrypt_self(sock, authmgr_handle, in_file_path, out_fd, offsets);
-                    if (err == 0)
-                        break;
-                }
-            }
-
-            if (err != 0) {
-                unlink(out_file_path);
-            }
-
-            if (err == -5) {
-                goto out;
+        // Check if output file already exists and is non-zero size, if so skip it
+        out_fd = open(out_file_path, O_RDONLY, 0);
+        if (out_fd >= 0) {
+            fstat(out_fd, &out_file_stat);
+            close(out_fd);
+            if (out_file_stat.st_size > 0) {
+                SOCK_LOG(sock, "[!] %s already exists and is non-zero size, skipping\n", out_file_path);
+                entry = (char *) entry + entry_len + 1;
+                continue;
             }
         }
 
-        entry = (struct dirent *) ((char *) entry + entry->d_reclen);
+//        for (int i = 0; i < 0x100; i++) {
+//            kernel_copyin(&spinlock_lock, g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18, 0x8);
+//            usleep(100);
+//        }
+
+        char parent_dir[PATH_MAX];
+        int last_slash = strrchr(out_file_path, '/') - out_file_path;
+        strncpy(parent_dir, out_file_path, last_slash);
+        parent_dir[last_slash] = '\0';
+        _mkdir(parent_dir);
+
+        // Decrypt
+        out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
+        if (out_fd < 0) {
+            SOCK_LOG(sock, "[!] failed to open %s for writing, errno: %d\n", out_file_path, errno);
+            entry = (char *) entry + entry_len + 1;
+            continue;
+        }
+        err = decrypt_self(sock, authmgr_handle, entry, out_fd, offsets);
+        if (err == -11) {
+            // Give 2 more attempts
+            for (int attempt = 0; attempt < 2; attempt++) {
+                out_fd = open(out_file_path, O_WRONLY | O_CREAT, 0644);
+                err = decrypt_self(sock, authmgr_handle, entry, out_fd, offsets);
+                if (err == 0)
+                    break;
+            }
+        }
+
+        if (err != 0) {
+            unlink(out_file_path);
+            SOCK_LOG(sock, "[!] failed to dump %s\n", entry);
+        }
+
+        if (err == -5) {
+            goto out;
+        }
+        
+        entry = (char *) entry + entry_len + 1;
     }
+
+    SOCK_LOG(sock, "[+] done\n");
 
 out:
-    // Unlock SBL spinlock
-    spinlock_lock = 0x0;
-    kernel_copyin(&spinlock_lock, g_kernel_data_base + offsets->offset_sbl_sxlock + 0x18, 0x8);
+    kernel_copyin(&spinlock_unlock, sbl_sxlock_addr, sizeof(spinlock_unlock));
 
-    if (err == -5) {
-        SOCK_LOG(sock, "[!] skipping rest of directory due to failed write\n");
-    } else {
-        SOCK_LOG(sock, "[+] completed directory\n");
-    }
+    return err;
 }
 
 int main()
 {
-	int sock = 0;
+	int sock = -1;
     uint64_t authmgr_handle;
     struct tailored_offsets offsets;
 
@@ -680,13 +881,6 @@ int main()
 	}
 #endif
 
-    // Initialize dump hex area
-    g_hexbuf = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (g_hexbuf == NULL) {
-        SOCK_LOG(sock, "[!] failed to allocate hex dump area\n");
-        goto out;
-    }
-
     // Initialize bump allocator
     g_bump_allocator_len  = 0x100000;
     g_bump_allocator_base = mmap(NULL, g_bump_allocator_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
@@ -697,13 +891,6 @@ int main()
 
     g_bump_allocator_cur = g_bump_allocator_base;
 
-    // Initialize dirent buffer
-    g_dirent_buf = mmap(NULL, 6 * 0x10000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (g_dirent_buf == NULL || (intptr_t)g_dirent_buf == -1) {
-        SOCK_LOG(sock, "[!] failed to allocate buffer for directory entries\n");
-        goto out;
-    }
-
     g_kernel_data_base = KERNEL_ADDRESS_DATA_BASE;
 
     // Tailor
@@ -712,48 +899,6 @@ int main()
 
     // See README for porting notes
     switch (version) {
-        case 0x1000000:
-        case 0x1010000:
-        case 0x1020000:
-        case 0x1050000:
-        case 0x1100000:
-        case 0x1110000:
-        case 0x1120000:
-        case 0x1130000:
-        case 0x1140000:
-            offsets.offset_authmgr_handle = 0xC18BC0;
-            offsets.offset_sbl_mb_mtx     = 0x2681518;
-            offsets.offset_mailbox_base   = 0x2681520;
-            offsets.offset_sbl_sxlock     = 0x2681528;
-            offsets.offset_mailbox_flags  = 0x2BE1028;
-            offsets.offset_mailbox_meta   = 0x2BE0DC0; // ?? seems to be blank
-            offsets.offset_dmpml4i        = 0x2F9F5B0;
-            offsets.offset_dmpdpi         = 0x2F9F5B4;
-            offsets.offset_pml4pml4i      = 0x2F9F30C;
-            offsets.offset_g_message_id   = 0x4260000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
-            break;
-        case 0x2000000:
-        case 0x2200000:
-        case 0x2250000:
-        case 0x2260000:
-        case 0x2300000:
-        case 0x2500000:
-        case 0x2700000:
-            offsets.offset_authmgr_handle = 0xC3E2D0;
-            offsets.offset_sbl_mb_mtx     = 0x26B1548;
-            offsets.offset_mailbox_base   = 0x26B1550;
-            offsets.offset_sbl_sxlock     = 0x26B1558;
-            offsets.offset_mailbox_flags  = 0x2C79A40;
-            offsets.offset_mailbox_meta   = 0x2C797E0;
-            offsets.offset_dmpml4i        = 0x3133B50;
-            offsets.offset_dmpdpi         = 0x3133B54;
-            offsets.offset_pml4pml4i      = 0x31338AC;
-            offsets.offset_g_message_id   = 0x4260000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
-            break;
         case 0x3000000:
         case 0x3100000:
         case 0x3200000:
@@ -768,8 +913,8 @@ int main()
             offsets.offset_dmpdpi         = 0x31BE4A4;
             offsets.offset_pml4pml4i      = 0x31BE1FC;
             offsets.offset_g_message_id   = 0x0008000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
             break;
         case 0x4000000:
         case 0x4030000:
@@ -785,8 +930,8 @@ int main()
             offsets.offset_dmpdpi         = 0x3257D04;
             offsets.offset_pml4pml4i      = 0x3257A5C;
             offsets.offset_g_message_id   = 0x0008000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
             break;
         case 0x5000000:
         case 0x5020000:
@@ -801,8 +946,8 @@ int main()
             offsets.offset_dmpdpi         = 0x3388D28;
             offsets.offset_pml4pml4i      = 0x3387A2C;
             offsets.offset_g_message_id   = 0x4260000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
             break;
         case 0x5500000:
             offsets.offset_authmgr_handle = 0xDEF410;
@@ -815,8 +960,43 @@ int main()
             offsets.offset_dmpdpi         = 0x3384D28;
             offsets.offset_pml4pml4i      = 0x3383A2C;
             offsets.offset_g_message_id   = 0x4260000;
-            offsets.offset_datacave_1     = 0x4270000;
-            offsets.offset_datacave_2     = 0x4280000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
+            break;
+        case 0x6000000:
+        case 0x6020000:
+        case 0x6500000:
+            offsets.offset_authmgr_handle = 0xE0F8D0;
+            offsets.offset_sbl_mb_mtx     = 0x27FF3A8;
+            offsets.offset_mailbox_base   = 0x27FF3B0;
+            offsets.offset_sbl_sxlock     = 0x27FF3B8;
+            offsets.offset_mailbox_flags  = 0x2DE9FC0;
+            offsets.offset_mailbox_meta   = 0x2DE9D60;
+            offsets.offset_dmpml4i        = 0x32D45F4;
+            offsets.offset_dmpdpi         = 0x32D45F8;
+            offsets.offset_pml4pml4i      = 0x32D32FC;
+            offsets.offset_g_message_id   = 0x4260000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
+            break;
+        case 0x7000000:
+        case 0x7010000:
+        case 0x7200000:
+        case 0x7400000:
+        case 0x7600000:
+        case 0x7610000:
+            offsets.offset_authmgr_handle = 0xE10330;
+            offsets.offset_sbl_mb_mtx     = 0x27EF808;
+            offsets.offset_mailbox_base   = 0x27EF810;
+            offsets.offset_sbl_sxlock     = 0x27EF818;
+            offsets.offset_mailbox_flags  = 0x2CBDFC0;
+            offsets.offset_mailbox_meta   = 0x2CBDD60;
+            offsets.offset_dmpml4i        = 0x2E1CAE4;
+            offsets.offset_dmpdpi         = 0x2E1CAE8;
+            offsets.offset_pml4pml4i      = 0x2E1B79C;
+            offsets.offset_g_message_id   = 0x4260000;
+            offsets.offset_datacave_1     = 0x8720000;
+            offsets.offset_datacave_2     = 0x8724000;
             break;
         default:
             SOCK_LOG(sock, "[!] unsupported firmware, dumping then bailing!\n");
@@ -848,23 +1028,22 @@ int main()
     authmgr_handle = get_authmgr_sm(sock, &offsets);
     SOCK_LOG(sock, "[+] got auth manager: %lu\n", authmgr_handle);
 
-    // preload_dirents(sock, "/", g_dirent_buf + (0 * 0x10000));
-    // preload_dirents(sock, "/system/common/lib", g_dirent_buf + (1 * 0x10000));
-    // preload_dirents(sock, "/system_ex/common_ex/lib", g_dirent_buf + (2 * 0x10000));
-    // preload_dirents(sock, "/system/priv/lib", g_dirent_buf + (3 * 0x10000));
-    // preload_dirents(sock, "/system/sys", g_dirent_buf + (4 * 0x10000));
-    preload_dirents(sock, "/system/vsh", g_dirent_buf + (5 * 0x10000));
+    // Example:
+    // dump_queue_add_file(sock, "/system/common/lib/libkernel_sys.sprx");
+    // dump_queue_add_dir(sock, "/system/vsh", 0);          // 0 -> non-recursive
+    // dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);  // 1 -> recursive
+    
+    // dump_queue_add_file (which is also used by dump_queue_add_dir) will skip files in 
+    // `/mnt/sandbox/pfsmnt/*-app0/` and `/mnt/sandbox/pfsmnt/*-patch0/`
+    // i did this so when i pass in `/mnt/sandbox/pfsmnt` it will only dump `/mnt/sandbox/pfsmnt/PPSA01487-app0-patch0-union`
+    // bc for ps5 games, `app0` and `app0-patch0-union` has the same files
 
-    // dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (0 * 0x10000), "/", "/mnt/usb0/PS5");
-    // dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (1 * 0x10000), "/system/common/lib", "/mnt/usb0/PS5/system/common/lib");
-    // dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (2 * 0x10000), "/system_ex/common_ex/lib", "/mnt/usb0/PS5/system_ex/common_ex/lib");
-    // dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (3 * 0x10000), "/system/priv/lib", "/mnt/usb0/PS5/system/priv/lib");
-    // dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (4 * 0x10000), "/system/sys", "/data/dump/system/sys");
-    dump_dir(sock, authmgr_handle, &offsets, g_dirent_buf + (5 * 0x10000), "/system/vsh", "/data/dump/system/vsh");
-
-    SOCK_LOG(sock, "[+] done!\n");
+    dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);
+    dump(sock, authmgr_handle, &offsets, "/mnt/usb0/dump");
 
 out:
+#ifdef LOG_TO_SOCKET
 	close(sock);
+#endif
 	return 0;
 }
