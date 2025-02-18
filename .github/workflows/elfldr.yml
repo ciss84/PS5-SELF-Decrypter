@@ -1,4 +1,4 @@
-name: CI
+name: Build News sdk payload
 
 on:
   push:
