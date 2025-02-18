@@ -862,7 +862,7 @@ int main()
     uint64_t authmgr_handle;
     struct tailored_offsets offsets;
 
-notify("Elf Game Dumper Started...");
+notify("Elf Game Dumper Started On Usb0...");
 
 #ifdef LOG_TO_SOCKET
     int ret;
