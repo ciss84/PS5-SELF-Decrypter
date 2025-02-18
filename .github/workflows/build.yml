@@ -1,4 +1,4 @@
-name: Build payload
+name: Build old sdk payload
 
 on:
   pull_request:
