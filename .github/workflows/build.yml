@@ -1,4 +1,4 @@
-name: Build old sdk payload
+name: Build News sdk payload
 
 on:
   pull_request:

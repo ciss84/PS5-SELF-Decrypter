@@ -1,4 +1,4 @@
-name: Build News sdk payload
+name: Build Old sdk payload
 
 on:
   push:
