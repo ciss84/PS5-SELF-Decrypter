@@ -19,6 +19,7 @@
 #include "authmgr.h"
 #include "self.h"
 #include "elf.h"
+#include "notify.h"
 
 #ifdef LOG_TO_SOCKET
 #define PC_IP   "10.0.3.3"
@@ -848,7 +849,7 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
     }
 
     SOCK_LOG(sock, "[+] done\n");
-
+    notify("Dump Elf done...");
 out:
     kernel_copyin(&spinlock_unlock, sbl_sxlock_addr, sizeof(spinlock_unlock));
 
@@ -860,6 +861,8 @@ int main()
 	int sock = -1;
     uint64_t authmgr_handle;
     struct tailored_offsets offsets;
+
+notify("Dump Elf Start...");
 
 #ifdef LOG_TO_SOCKET
     int ret;
@@ -1030,7 +1033,7 @@ int main()
 
     // Example:
     // dump_queue_add_file(sock, "/system/common/lib/libkernel_sys.sprx");
-    dump_queue_add_dir(sock, "/system/vsh", 0);          // 0 -> non-recursive
+    //dump_queue_add_dir(sock, "/system/vsh", 0);          // 0 -> non-recursive
     // dump_queue_add_dir(sock, "/mnt/sandbox/pfsmnt", 1);  // 1 -> recursive
     
     // dump_queue_add_file (which is also used by dump_queue_add_dir) will skip files in 
