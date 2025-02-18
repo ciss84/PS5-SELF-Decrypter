@@ -849,7 +849,7 @@ int dump(int sock, uint64_t authmgr_handle, struct tailored_offsets *offsets, co
     }
 
     SOCK_LOG(sock, "[+] done\n");
-    notify("Dump Elf done...");
+    notify("Elf Game Dump done...");
 out:
     kernel_copyin(&spinlock_unlock, sbl_sxlock_addr, sizeof(spinlock_unlock));
 
@@ -862,7 +862,7 @@ int main()
     uint64_t authmgr_handle;
     struct tailored_offsets offsets;
 
-notify("Dump Elf Start...");
+notify("Elf Game Dumper Started...");
 
 #ifdef LOG_TO_SOCKET
     int ret;
