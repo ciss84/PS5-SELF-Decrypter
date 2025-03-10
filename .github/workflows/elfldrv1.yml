@@ -1,4 +1,4 @@
-name: Build News sdk payload
+name: Build payload
 
 on:
   pull_request:
@@ -56,4 +56,4 @@ jobs:
       with:
         name: ps5-self-decrypter
         path: ./bin/ps5-self-decrypter.elf
-        if-no-files-found
+        if-no-files-found: error
